@@ -1,0 +1,12 @@
+# probe-aws built from this checkout, for e2e/workflow.yml. Probe resolves an
+# action before the first job starts, so the executable is built before
+# probe runs:
+#
+#   go build -o e2e/action/probe-aws . && probe --allow-host localhost --allow-action shell e2e/workflow.yml
+name: aws
+description: Call AWS services and the services compatible with them, such as S3 and SQS, signed with Signature Version 4
+guard: [read-only, allow-host]
+params: [s3, sqs, request, region, endpoint, access_key_id, secret_access_key, session_token, timeout]
+runs:
+  using: binary
+  path: probe-aws

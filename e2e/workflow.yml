@@ -1,0 +1,483 @@
+# The end-to-end tests: Versity Gateway, which serves a directory over the S3
+# protocol and checks each signature, started in a container, and probe-aws
+# run against it, all in this one workflow. It runs under --allow-host, which
+# the action keeps to; the shell steps that run the container are let run
+# with --allow-action. Run it from the repository root, with the action built
+# first, as Probe resolves it before the first job:
+#
+#   go build -o e2e/action/probe-aws . && probe --allow-host localhost --allow-action shell e2e/workflow.yml
+#
+# E2E_PORT is the port on this side, E2E_CONTAINER the container's name, and
+# E2E_KEEP=1 leaves the container running afterwards. PROBE is the probe the
+# last job runs e2e/read-only.yml with, which defaults to the one on PATH.
+name: probe-aws against Versity Gateway and ElasticMQ
+
+# The action as it was just built, by the name a workflow would give a
+# released one.
+actions:
+  aws: ./action
+
+vars:
+  # The release the tests are written against.
+  image: versity/versitygw:v1.8.0@sha256:30292fc2eeacc67a36993b01f7a7a5e3361a19cced0e80c1d71cfa2a4b0a2499
+  container: "{{E2E_CONTAINER ?? 'probe-aws-e2e'}}"
+  port: "{{E2E_PORT ?? '19000'}}"
+  endpoint: "http://localhost:{{vars.port}}"
+  keep: "{{E2E_KEEP ?? ''}}"
+  probe: "{{PROBE ?? 'probe'}}"
+  bucket: probe-e2e
+  access_key_id: probe
+  secret_access_key: "{{random_str(32)}}"
+  # ElasticMQ, which speaks the JSON protocol of SQS. It checks no
+  # signature: the S3 jobs tell that the signature is right.
+  sqs_image: softwaremill/elasticmq-native:1.7.1@sha256:e4580ab9ad1bd5cd37b4ba04911bc5ccc8cd2d9ab4de56ece65acee71c24e05c
+  sqs_container: "{{E2E_SQS_CONTAINER ?? 'probe-aws-e2e-sqs'}}"
+  sqs_port: "{{E2E_SQS_PORT ?? '19324'}}"
+  sqs_endpoint: "http://localhost:{{vars.sqs_port}}"
+  # A key with what has to be encoded in a path: a space, a plus and a
+  # character outside ASCII.
+  report: "reports/2026 Q3/été+plus.txt"
+
+jobs:
+- name: Start the storage
+  id: storage
+  steps:
+  # Before anything is started, so that whatever happens next, the container
+  # goes when the workflow ends: Probe stops a background command then, as it
+  # does when it is interrupted. E2E_KEEP=1 leaves it.
+  - name: Remove the container when the workflow ends
+    uses: shell
+    skipif: vars.keep == "1"
+    with:
+      cmd: "trap 'docker rm -f {{vars.container}} >/dev/null 2>&1; exit 0' TERM INT; while :; do sleep 1; done"
+      background: true
+    test: status == -1
+
+  # The gateway serves each directory under /data as a bucket, so the bucket
+  # is made before it starts: the action has no way to make one.
+  - name: Start Versity Gateway with a bucket
+    uses: shell
+    with:
+      cmd: >-
+        docker rm -f {{vars.container}} >/dev/null 2>&1;
+        docker run -d --name {{vars.container}}
+        -p {{vars.port}}:7070
+        --entrypoint sh
+        {{vars.image}}
+        -c 'mkdir -p /data/{{vars.bucket}} && exec versitygw --access {{vars.access_key_id}} --secret {{vars.secret_access_key}} posix /data'
+      timeout: 300s
+    test: res.code == 0
+
+  - name: Wait for the storage
+    uses: aws
+    with:
+      endpoint: "{{vars.endpoint}}"
+      access_key_id: "{{vars.access_key_id}}"
+      secret_access_key: "{{vars.secret_access_key}}"
+      s3:
+        bucket: "{{vars.bucket}}"
+        list: ""
+    retry: {max_attempts: 60, interval: 1s}
+    test: status == 0 && res.count == 0 && res.truncated == false
+
+- name: Objects written and read back
+  id: objects
+  needs: [storage]
+  defaults:
+    aws:
+      endpoint: "{{vars.endpoint}}"
+      access_key_id: "{{vars.access_key_id}}"
+      secret_access_key: "{{vars.secret_access_key}}"
+      s3:
+        bucket: "{{vars.bucket}}"
+  steps:
+  - name: Put a text object with metadata
+    id: put
+    uses: aws
+    with:
+      s3:
+        put: "{{vars.report}}"
+        body: "Bonjour, été\n"
+        content_type: text/plain; charset=utf-8
+        metadata:
+          owner: probe
+          run: 7
+    test: |
+      status == 0 && res.code == 200 && res.etag != "" &&
+      req.signed == true && req.size == 15 &&
+      req.url == vars.endpoint + "/" + vars.bucket + "/reports/2026%20Q3/%C3%A9t%C3%A9%2Bplus.txt"
+    outputs:
+      etag: res.etag
+      sha256: req.sha256
+
+  - name: Head it
+    uses: aws
+    with:
+      s3:
+        head: "{{vars.report}}"
+    test: |
+      status == 0 && res.code == 200 &&
+      res.size == 15 && res.etag == outputs.put.etag &&
+      res.content_type == "text/plain; charset=utf-8" &&
+      res.metadata.owner == "probe" && res.metadata.run == "7" &&
+      res.last_modified != ""
+
+  - name: Get it
+    uses: aws
+    with:
+      s3:
+        get: "{{vars.report}}"
+    test: |
+      status == 0 && res.code == 200 &&
+      res.body == "Bonjour, été\n" && res.sha256 == outputs.put.sha256 &&
+      res.size == 15 && res.etag == outputs.put.etag &&
+      res.truncated == false && res.binary == false &&
+      res.metadata.owner == "probe"
+
+  - name: Put an object written as YAML, sent as JSON
+    uses: aws
+    with:
+      s3:
+        put: config/app.json
+        body:
+          enabled: true
+          limits: [1, 2]
+    test: status == 0 && req.content_type == "application/json"
+
+  - name: Get it parsed
+    uses: aws
+    with:
+      s3:
+        get: config/app.json
+    test: |
+      status == 0 &&
+      res.body.enabled == true && res.body.limits == [1, 2] &&
+      res.rawbody == '{"enabled":true,"limits":[1,2]}' &&
+      res.content_type == "application/json"
+
+  - name: Put a file
+    id: file
+    uses: aws
+    with:
+      s3:
+        put: files/LICENSE
+        file: LICENSE
+    test: status == 0 && req.size > 1000
+    outputs:
+      file_sha256: req.sha256
+      file_size: req.size
+
+  - name: Get the file, whose digest is the one that was sent
+    uses: aws
+    with:
+      s3:
+        get: files/LICENSE
+    test: |
+      status == 0 && res.sha256 == outputs.file.file_sha256 &&
+      res.size == outputs.file.file_size && res.body contains "Permission is hereby granted"
+
+  - name: Put an empty object
+    uses: aws
+    with:
+      s3:
+        put: files/empty
+        body: ""
+    test: status == 0 && req.size == 0
+
+  # A list without a prefix, written with nothing after the key.
+  - name: List every object
+    uses: aws
+    with:
+      s3:
+        list:
+    test: |
+      status == 0 && res.count == 4 && res.truncated == false &&
+      map(res.objects, #.key) == ["config/app.json", "files/LICENSE", "files/empty", vars.report]
+
+  - name: List under a prefix, the key read as it was written
+    uses: aws
+    with:
+      s3:
+        list: "reports/2026 Q3/"
+    test: |
+      status == 0 && res.count == 1 &&
+      res.objects[0].key == vars.report && res.objects[0].size == 15 &&
+      res.objects[0].etag == outputs.put.etag && res.objects[0].last_modified != ""
+
+  - name: List no more than one
+    uses: aws
+    with:
+      s3:
+        list: files/
+        max_keys: 1
+    test: status == 0 && res.count == 1 && res.truncated == true && res.objects[0].key == "files/LICENSE"
+
+- name: What the storage refuses is a result
+  id: refusals
+  needs: [objects]
+  defaults:
+    aws:
+      endpoint: "{{vars.endpoint}}"
+      access_key_id: "{{vars.access_key_id}}"
+      secret_access_key: "{{vars.secret_access_key}}"
+      s3:
+        bucket: "{{vars.bucket}}"
+  steps:
+  - name: A key that is not there
+    uses: aws
+    with:
+      s3:
+        get: files/none
+    test: status == 1 && res.code == 404 && res.error_code == "NoSuchKey" && res.error_message != ""
+
+  - name: The same, by head, which has no body to say why
+    uses: aws
+    with:
+      s3:
+        head: files/none
+    test: status == 1 && res.code == 404 && res.error_code == ""
+
+  - name: A bucket that is not there
+    uses: aws
+    with:
+      s3:
+        bucket: probe-e2e-none
+        list: ""
+    test: status == 1 && res.code == 404 && res.error_code == "NoSuchBucket"
+
+  # The storage works out the signature itself, so a wrong key is told here,
+  # and a right one was told in every step above.
+  - name: A wrong secret access key
+    uses: aws
+    with:
+      secret_access_key: not-the-secret-access-key
+      s3:
+        get: files/LICENSE
+    test: status == 1 && res.code == 403 && res.error_code == "SignatureDoesNotMatch"
+
+  - name: A wrong secret access key, writing
+    uses: aws
+    with:
+      secret_access_key: not-the-secret-access-key
+      s3:
+        put: files/LICENSE
+        body: overwritten
+    test: status == 1 && res.code == 403 && res.error_code == "SignatureDoesNotMatch"
+
+- name: Under --read-only
+  id: read_only
+  needs: [refusals]
+  steps:
+  # Probe is run again, read-only, on a workflow that reads and then writes.
+  # A step the guard refuses ends that run with the exit code 2.
+  - name: Reads are run and a write is refused
+    uses: shell
+    with:
+      cmd: "{{vars.probe}} --read-only --allow-host localhost:{{vars.port}} e2e/read-only.yml"
+      env:
+        E2E_ENDPOINT: "{{vars.endpoint}}"
+        E2E_BUCKET: "{{vars.bucket}}"
+        E2E_ACCESS_KEY_ID: "{{vars.access_key_id}}"
+        E2E_SECRET_ACCESS_KEY: "{{vars.secret_access_key}}"
+      timeout: 120s
+    test: |
+      res.code == 2 &&
+      (res.stdout + res.stderr) contains "put writes to the bucket, and the run is read-only"
+    echo: "{{res.stdout}}{{res.stderr}}"
+
+  - name: The object the refused step would have replaced is as it was
+    uses: aws
+    with:
+      endpoint: "{{vars.endpoint}}"
+      access_key_id: "{{vars.access_key_id}}"
+      secret_access_key: "{{vars.secret_access_key}}"
+      s3:
+        bucket: "{{vars.bucket}}"
+        get: files/LICENSE
+    test: status == 0 && res.sha256 == outputs.file.file_sha256
+
+- name: Objects deleted
+  needs: [read_only]
+  defaults:
+    aws:
+      endpoint: "{{vars.endpoint}}"
+      access_key_id: "{{vars.access_key_id}}"
+      secret_access_key: "{{vars.secret_access_key}}"
+      s3:
+        bucket: "{{vars.bucket}}"
+  steps:
+  - name: Delete an object
+    uses: aws
+    with:
+      s3:
+        delete: "{{vars.report}}"
+    test: status == 0 && res.code == 204
+
+  - name: It is gone
+    uses: aws
+    with:
+      s3:
+        get: "{{vars.report}}"
+    test: status == 1 && res.code == 404 && res.error_code == "NoSuchKey"
+
+  - name: And so is its key
+    uses: aws
+    with:
+      s3:
+        list: reports/
+    test: status == 0 && res.count == 0
+
+- name: Start the queues
+  id: queues
+  steps:
+  - name: Remove the queue container when the workflow ends
+    uses: shell
+    skipif: vars.keep == "1"
+    with:
+      cmd: "trap 'docker rm -f {{vars.sqs_container}} >/dev/null 2>&1; exit 0' TERM INT; while :; do sleep 1; done"
+      background: true
+    test: status == -1
+
+  - name: Start ElasticMQ
+    uses: shell
+    with:
+      cmd: >-
+        docker rm -f {{vars.sqs_container}} >/dev/null 2>&1;
+        docker run -d --name {{vars.sqs_container}} -p {{vars.sqs_port}}:9324 {{vars.sqs_image}}
+      timeout: 300s
+    test: res.code == 0
+
+  # The action has no operation that makes a queue, so it is made by a
+  # request of its own, which is what request is for.
+  - name: Make a queue with a request
+    id: create
+    uses: aws
+    with:
+      region: us-east-1
+      endpoint: "{{vars.sqs_endpoint}}"
+      access_key_id: "{{vars.access_key_id}}"
+      secret_access_key: "{{vars.secret_access_key}}"
+      request:
+        service: sqs
+        post: /
+        headers:
+          content-type: application/x-amz-json-1.0
+          x-amz-target: AmazonSQS.CreateQueue
+        body:
+          QueueName: jobs
+    retry: {max_attempts: 60, interval: 1s}
+    test: status == 0 && res.code == 200 && res.body.QueueUrl endsWith "/jobs"
+    outputs:
+      queue_url: res.body.QueueUrl
+
+- name: Messages sent and received
+  needs: [queues]
+  defaults:
+    aws:
+      region: us-east-1
+      endpoint: "{{vars.sqs_endpoint}}"
+      access_key_id: "{{vars.access_key_id}}"
+      secret_access_key: "{{vars.secret_access_key}}"
+  steps:
+  - name: A long poll of an empty queue waits, and returns nothing
+    uses: aws
+    with:
+      sqs:
+        receive: "{{outputs.create.queue_url}}"
+        wait: 2s
+    test: status == 0 && res.count == 0 && res.messages == [] && rt.sec >= 1.5
+
+  - name: Send a message written as YAML, sent as JSON
+    id: send
+    uses: aws
+    with:
+      sqs:
+        send: "{{outputs.create.queue_url}}"
+        body:
+          job: 42
+        attributes:
+          kind: export
+    test: status == 0 && res.message_id != "" && res.md5 != ""
+    outputs:
+      id: res.message_id
+
+  - name: Look at it, leaving it in the queue
+    uses: aws
+    with:
+      sqs:
+        receive: "{{outputs.create.queue_url}}"
+        wait: 5s
+        visibility_timeout: 0
+    test: status == 0 && res.count == 1 && res.messages[0].id == outputs.send.id
+
+  - name: Receive it
+    id: receive
+    uses: aws
+    with:
+      sqs:
+        receive: "{{outputs.create.queue_url}}"
+        wait: 5s
+        visibility_timeout: 60
+    test: |
+      status == 0 && res.count == 1 &&
+      res.messages[0].id == outputs.send.id &&
+      res.messages[0].body.job == 42 &&
+      res.messages[0].rawbody == '{"job":42}' &&
+      res.messages[0].attributes.kind == "export" &&
+      res.messages[0].receipt_handle != ""
+    outputs:
+      handle: res.messages[0].receipt_handle
+
+  - name: It is hidden while it is received
+    uses: aws
+    with:
+      sqs:
+        receive: "{{outputs.create.queue_url}}"
+    test: status == 0 && res.count == 0
+
+  - name: Delete it
+    uses: aws
+    with:
+      sqs:
+        delete: "{{outputs.create.queue_url}}"
+        receipt_handle: "{{outputs.receive.handle}}"
+    test: status == 0 && res.code == 200
+
+  - name: Send two more
+    uses: aws
+    iteration:
+      - text: first
+      - text: second
+    with:
+      sqs:
+        send: "{{outputs.create.queue_url}}"
+        body: "{{vars.text}}"
+    test: status == 0
+
+  - name: Receive and delete them in one step
+    uses: aws
+    with:
+      sqs:
+        receive: "{{outputs.create.queue_url}}"
+        wait: 5s
+        max: 10
+        delete_received: true
+    retry: {max_attempts: 5, interval: 1s}
+    test: |
+      status == 0 && res.count == 2 && res.deleted == 2 &&
+      sort(map(res.messages, #.body)) == ["first", "second"]
+
+  - name: The queue is empty
+    uses: aws
+    with:
+      sqs:
+        receive: "{{outputs.create.queue_url}}"
+        wait: 1s
+    test: status == 0 && res.count == 0
+
+  - name: A queue that is not there is a result
+    uses: aws
+    with:
+      sqs:
+        receive: "{{vars.sqs_endpoint}}/000000000000/none"
+    test: status == 1 && res.code >= 400 && res.error_code != ""
