@@ -4,4 +4,9 @@ guard: [read-only, allow-host]
 params: [s3, sqs, request, region, endpoint, access_key_id, secret_access_key, session_token, timeout]
 runs:
   using: binary
-  url: https://github.com/mozership/probe-aws/releases/download/v0.0.0/probe-aws_{os}_{arch}
+  url: https://github.com/mozership/probe-aws/releases/download/v0.1.0/probe-aws_{os}_{arch}
+  checksums:
+    darwin_amd64: "e6a35d2473a33c1284e702f89ea10fcf1dc36153c2d4c170e1de481010bb107e"
+    darwin_arm64: "a815bef72bd4126447d384668955761eaa5dae2ce79e3bf8c97f4069390a94c7"
+    linux_amd64: "d1e93b1615e3471f97c49effb36dbe1a545b962a66f72ac505bf69dbe7596073"
+    linux_arm64: "08d8bce67853ec805b3899101881dcfc3a6816d3131a7fdde49a8847a1aaeed8"
